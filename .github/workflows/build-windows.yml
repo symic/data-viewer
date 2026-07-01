@@ -1,38 +1,909 @@
-name: Build Windows EXE
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.dates import DateFormatter
+from matplotlib.widgets import SpanSelector
+import os
+import glob
+from datetime import datetime, timedelta
+import random
+import platform
 
-on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+# 根据操作系统自动设置中文字体
+system = platform.system()
+if system == 'Windows':
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'sans-serif']
+elif system == 'Darwin':
+    plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'PingFang SC', 'Heiti TC', 'Apple LiGothic Medium', 'sans-serif']
+else:
+    plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
 
-jobs:
-  build:
-    runs-on: windows-latest
+class DataViewerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("数据查看器 - 多点位布局系统")
+        
+        # 窗口大小自适应
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(1680, screen_width - 50)
+        height = min(1030, screen_height - 80)
+        self.root.geometry(f"{width}x{height}")
+        
+        # 设置ttk样式，确保标签文字可见
+        self.style = ttk.Style()
+        self.style.theme_use('clam')  # 使用clam主题，文字更清晰
+        self.style.configure('TNotebook.Tab', font=('Arial', 11, 'bold'), padding=[15, 5])
+        self.style.map('TNotebook.Tab', 
+                       background=[('selected', '#E8E8E8'), ('!selected', '#F8F8F8')],
+                       foreground=[('selected', '#000000'), ('!selected', '#333333')])
+        
+        # 数据存储
+        self.folder_path = ""
+        self.combined_df = None
+        self.display_df = None
+        self.original_df = None
+        self.device_ids = []
+        self.selected_devices = []
+        self.time_col = 'timestamp'
+        self.value_col = 'pid'
+        
+        # 缩放历史
+        self.zoom_history = []
+        
+        # SpanSelector
+        self.span_selector = None
+        
+        # 点位布局数据
+        self.grid_positions = {}
+        self.placed_devices = []
+        self.selected_device_for_grid = None
+        
+        # 动画相关
+        self.animation_running = False
+        self.animation_paused = False
+        self.animation_index = 0
+        self.animation_timer = None
+        
+        # 网格配置
+        self.GRID_ROWS = 7
+        self.GRID_COLS = 5
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+        # 网格移动/交换的临时选中状态
+        self.picked_device = None  # 当前拾取的设备
+        self.picked_position = None  # 当前拾取的位置 (row, col)  
 
-      - name: Setup Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+        # 默认路径
+        self.default_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        
+        self.setup_ui()
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install -r requirements.txt
+    def convert_timestamp(self, ts_value):
+        if pd.isna(ts_value):
+            return None
+        try:
+            ts = int(ts_value)
+            return pd.Timestamp(ts, unit='s', tz='Asia/Shanghai').strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            return str(ts_value)
 
-      - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller -F -w `
-            --name="数据查看器" `
-            main.py
+    def get_color_by_level(self, value, max_value):
+        """五等分颜色：红橙黄蓝绿"""
+        if max_value <= 0:
+            return "#00CC00"
+        ratio = value / max_value
+        if ratio > 0.8:
+            return "#FF0000"  # 红
+        elif ratio > 0.6:
+            return "#FF8C00"  # 橙
+        elif ratio > 0.4:
+            return "#FFD700"  # 黄
+        elif ratio > 0.2:
+            return "#4169E1"  # 蓝
+        else:
+            return "#00CC00"  # 绿
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-exe
-          path: dist/数据查看器.exe
+    def setup_ui(self):
+        # 底部全局状态栏
+        self.setup_global_status_bar()
+
+        # 主框架
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 左侧面板
+        self.left_panel = ttk.Frame(main_frame, width=315, padding=10)
+        self.left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 0), pady=5)
+        self.left_panel.pack_propagate(False)
+        
+        # 右侧容器
+        self.right_container = ttk.Frame(main_frame, padding=5)
+        self.right_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.setup_left_panel()
+        self.setup_notebook()
+
+    def setup_left_panel(self):
+        # 1. 文件夹选择
+        ttk.Label(self.left_panel, text="数据源", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        btn_frame = ttk.Frame(self.left_panel)
+        btn_frame.pack(fill=tk.X, pady=2)
+        self.folder_btn = ttk.Button(btn_frame, text="选择数据文件夹", command=self.load_folder)
+        self.folder_btn.pack(fill=tk.X)
+        self.path_label = ttk.Label(self.left_panel, text="未选择", foreground="gray", wraplength=290)
+        self.path_label.pack(anchor=tk.W, pady=2)
+        
+        ttk.Separator(self.left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        
+        # 2. 时间控制
+        ttk.Label(self.left_panel, text="时间控制", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(self.left_panel, text="时间范围:").pack(anchor=tk.W)
+        self.time_range_label = ttk.Label(self.left_panel, text="--:--:-- 至 --:--:--", foreground="blue")
+        self.time_range_label.pack(anchor=tk.W, pady=2)
+        
+        tf1 = ttk.Frame(self.left_panel)
+        tf1.pack(fill=tk.X, pady=2)
+        ttk.Label(tf1, text="起始:").pack(side=tk.LEFT)
+        self.start_time_var = tk.StringVar()
+        ttk.Entry(tf1, textvariable=self.start_time_var, width=14).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        
+        tf2 = ttk.Frame(self.left_panel)
+        tf2.pack(fill=tk.X, pady=2)
+        ttk.Label(tf2, text="结束:").pack(side=tk.LEFT)
+        self.end_time_var = tk.StringVar()
+        ttk.Entry(tf2, textvariable=self.end_time_var, width=14).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        
+        self.filter_btn = ttk.Button(self.left_panel, text="筛选时间", command=self.filter_by_time)
+        self.filter_btn.pack(fill=tk.X, pady=5)
+        
+        ttk.Separator(self.left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        
+        # 3. 缩放控制
+        ttk.Label(self.left_panel, text="缩放控制", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        zf = ttk.Frame(self.left_panel)
+        zf.pack(fill=tk.X, pady=5)
+        self.undo_zoom_btn = ttk.Button(zf, text="← 撤销缩放", command=self.undo_zoom)
+        self.undo_zoom_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        self.reset_btn = ttk.Button(zf, text="恢复全图", command=self.reset_view)
+        self.reset_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=1)
+        ttk.Label(self.left_panel, text="💡 在曲线图上拖拽可放大", foreground="gray", font=("", 9)).pack(anchor=tk.W)
+        
+        ttk.Separator(self.left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        
+        # 4. 设备ID筛选
+        ttk.Label(self.left_panel, text="设备ID筛选", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        sf = ttk.Frame(self.left_panel)
+        sf.pack(fill=tk.X, pady=2)
+        self.select_all_btn = ttk.Button(sf, text="全选", command=self.select_all_devices)
+        self.select_all_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        self.deselect_all_btn = ttk.Button(sf, text="取消全选", command=self.deselect_all_devices)
+        self.deselect_all_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=1)
+        
+        # 设备列表带滚动条
+        lc = ttk.Frame(self.left_panel)
+        lc.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.device_canvas = tk.Canvas(lc, highlightthickness=0, width=290, height=200)
+        device_scrollbar = ttk.Scrollbar(lc, orient=tk.VERTICAL, command=self.device_canvas.yview)
+        self.device_list_frame = ttk.Frame(self.device_canvas)
+        
+        self.device_list_frame.bind(
+            "<Configure>",
+            lambda e: self.device_canvas.configure(scrollregion=self.device_canvas.bbox("all"))
+        )
+        
+        self.device_canvas.create_window((0, 0), window=self.device_list_frame, anchor="nw")
+        self.device_canvas.configure(yscrollcommand=device_scrollbar.set)
+        
+        self.device_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        device_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.device_canvas.bind("<Enter>", lambda e: self._bind_mousewheel())
+        self.device_canvas.bind("<Leave>", lambda e: self._unbind_mousewheel())
+        
+        self.device_vars = {}
+
+    def _bind_mousewheel(self):
+        self.device_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self):
+        self.device_canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event):
+        self.device_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def setup_notebook(self):
+        self.notebook = ttk.Notebook(self.right_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # 曲线页面 - 使用Frame包装，确保标签文字可见
+        self.curve_tab = ttk.Frame(self.notebook)
+        self.point_tab = ttk.Frame(self.notebook)
+        
+        # 添加到Notebook
+        self.notebook.add(self.curve_tab, text="  曲线  ")
+        self.notebook.add(self.point_tab, text="  点位  ")
+        
+        # 先设置曲线页面（空白）
+        self.setup_curve_tab()
+        # 再设置点位页面
+        self.setup_point_tab()
+
+    def setup_curve_tab(self):
+         # 曲线页面底部状态栏
+        curve_status = ttk.Frame(self.curve_tab, padding=5, relief=tk.SUNKEN, borderwidth=2)
+        curve_status.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        self.curve_status_label = ttk.Label(curve_status, text="就绪", foreground="gray")
+        self.curve_status_label.pack(anchor=tk.W)
+        
+        self.curve_max_label = ttk.Label(curve_status, text="最大浓度值: --", foreground="blue", font=("", 11, "bold"))
+        self.curve_max_label.pack(anchor=tk.W, pady=2)
+        
+        self.curve_stats_label = ttk.Label(curve_status, text="显示设备数: -- | 数据行数: --", foreground="green", font=("", 9))
+        self.curve_stats_label.pack(anchor=tk.W, pady=1)
+
+        """曲线页面：初始为空白"""
+        plot_frame = ttk.Frame(self.curve_tab)
+        plot_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.fig = Figure(figsize=(14, 8), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("请先选择数据文件夹加载数据", fontsize=14)
+        self.ax.set_xlabel("时间")
+        self.ax.set_ylabel("浓度值 (mg/m³)")
+        self.ax.grid(True, alpha=0.3)
+        self.ax.text(0.5, 0.5, "等待数据加载...", ha='center', va='center', fontsize=16, alpha=0.5, transform=self.ax.transAxes)
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # === 新增：鼠标悬停显示浓度值 ===
+        self.annotation = self.ax.annotate(
+            "", xy=(0, 0), xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", edgecolor="black", alpha=0.8),
+            fontsize=10, fontweight="bold",
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0")
+        )
+        self.annotation.set_visible(False)
+        
+        # 绑定鼠标移动事件
+        self.canvas.mpl_connect("motion_notify_event", self.on_hover)
+        
+    def on_hover(self, event):
+        """鼠标悬停时显示浓度值和设备ID - 优化版"""
+        if event.inaxes != self.ax:
+            self.annotation.set_visible(False)
+            self.canvas.draw_idle()
+            return
+        
+        if self.display_df is None or self.display_df.empty or event.xdata is None or event.ydata is None:
+            self.annotation.set_visible(False)
+            self.canvas.draw_idle()
+            return
+        
+        from matplotlib.dates import num2date, date2num
+        mouse_dt = num2date(event.xdata).replace(tzinfo=None)
+        mouse_y = event.ydata
+        
+        closest_text = ""
+        closest_num_point = None
+        min_dist = float('inf')
+        
+        # 检查所有选中的设备
+        for dev in self.selected_devices:
+            if dev not in self.device_ids:
+                continue
+            dd = self.display_df[self.display_df['device_id'] == dev]
+            if dd.empty:
+                continue
+            
+            # 向量化计算时间差，快速找到最近的点
+            time_diffs = abs(dd[self.time_col] - mouse_dt).dt.total_seconds()
+            min_time_idx = time_diffs.idxmin()
+            min_time_diff = time_diffs[min_time_idx]
+            
+            # 如果时间差太大，跳过这个设备
+            if min_time_diff > 60:
+                continue
+            
+            row = dd.loc[min_time_idx]
+            conc_diff = abs(row[self.value_col] - mouse_y)
+            
+            # 如果浓度差太大，跳过
+            if conc_diff > 10:
+                continue
+            
+            distance = min_time_diff + conc_diff * 5
+            
+            if distance < min_dist:
+                min_dist = distance
+                closest_text = f"设备: {dev}\n浓度: {row[self.value_col]:.2f} mg/m³\n时间: {row[self.time_col].strftime('%H:%M:%S')}"
+                closest_num_point = (date2num(row[self.time_col]), row[self.value_col])
+        
+        if closest_num_point is not None:
+            try:
+                self.annotation.remove()
+            except:
+                pass
+            
+            self.annotation = self.ax.annotate(
+                closest_text,
+                xy=closest_num_point,
+                xytext=(15, 15),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", edgecolor="orange", alpha=0.95),
+                fontsize=10, fontweight="bold",
+                color="black",
+                arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0", color="orange", lw=2)
+            )
+            self.annotation.set_visible(True)
+            self.annotation.set_zorder(100)
+        else:
+            try:
+                self.annotation.set_visible(False)
+            except:
+                pass
+        
+        self.canvas.draw_idle()
+
+    def setup_point_tab(self):
+        """点位页面"""
+        point_main = ttk.Frame(self.point_tab)
+        point_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # 上半部分：可选设备列表
+        top_frame = ttk.LabelFrame(point_main, text="可选设备 (点击选中 → 再点击下方网格绑定)", padding=10)
+        top_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        # 一键部署按钮 - 放在最上面右侧
+        deploy_frame = ttk.Frame(top_frame)
+        deploy_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.deploy_btn = ttk.Button(deploy_frame, text="一键部署", command = self.auto_deploy)
+        self.deploy_btn.pack(side=tk.RIGHT, padx=5)
+        
+        self.device_pool_frame = ttk.Frame(top_frame)
+        self.device_pool_frame.pack(fill=tk.X, pady=5)  
+
+        # 控制按钮
+        cf = ttk.Frame(point_main)
+        cf.pack(fill=tk.X, pady=5)
+        
+        self.start_btn = ttk.Button(cf, text="▶ 开始", command=self.toggle_animation)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.end_btn = ttk.Button(cf, text="⏹ 结束", command=self.stop_animation)
+        self.end_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.reset_grid_btn = ttk.Button(cf, text="重置布局", command=self.reset_grid_layout)
+        self.reset_grid_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(cf, text="速度:").pack(side=tk.LEFT, padx=(20, 5))
+        self.speed_var = tk.IntVar(value=5)
+        ttk.Scale(cf, from_=1, to=10, variable=self.speed_var, orient=tk.HORIZONTAL, length=120).pack(side=tk.LEFT)
+        
+        ttk.Label(cf, text="当前时间:").pack(side=tk.LEFT, padx=(20, 5))
+        self.anim_time_label = ttk.Label(cf, text="--:--:--", foreground="blue", font=("", 12, "bold"))
+        self.anim_time_label.pack(side=tk.LEFT)
+        
+        # 下半部分：网格
+        bottom_frame = ttk.LabelFrame(point_main, text=f"点位布局网格 ({self.GRID_ROWS}行 × {self.GRID_COLS}列) - 点击已绑定的格子可解除绑定", padding=10)
+        bottom_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.grid_container = ttk.Frame(bottom_frame)
+        self.grid_container.pack(expand=True)
+        
+        self.grid_buttons = []
+        for i in range(self.GRID_ROWS * self.GRID_COLS):
+            r = i // self.GRID_COLS
+            c = i % self.GRID_COLS
+            lbl = tk.Label(self.grid_container, text="空", bg="#F0F0F0", fg="black",
+                          font=("Arial", 9, "bold"), width=10, height=2,
+                          relief=tk.RAISED, cursor="hand2",
+                          highlightthickness=0)
+            lbl.grid(row=r, column=c, padx=3, pady=3)
+            lbl.bind("<Button-1>", lambda e, idx=i: self.grid_click(idx))
+            lbl.bind("<Double-Button-1>", lambda e, idx=i: self.grid_double_click(idx))
+            self.grid_buttons.append(lbl)
+        
+        for i in range(self.GRID_ROWS):
+            self.grid_container.grid_rowconfigure(i, weight=1)
+        for i in range(self.GRID_COLS):
+            self.grid_container.grid_columnconfigure(i, weight=1)
+        
+        # 点位页面底部状态栏
+        point_status = ttk.Frame(self.point_tab, padding=5, relief=tk.SUNKEN, borderwidth=2)
+        point_status.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        self.point_status_label = ttk.Label(point_status, text="就绪", foreground="gray")
+        self.point_status_label.pack(anchor=tk.W)
+
+    def setup_global_status_bar(self):
+        """全局底部状态栏"""
+        gs = ttk.Frame(self.root, padding=5, relief=tk.SUNKEN, borderwidth=2)
+        gs.pack(fill=tk.X, side=tk.BOTTOM)
+        self.global_status_label = ttk.Label(gs, text="全局状态: 就绪", foreground="gray")
+        self.global_status_label.pack(anchor=tk.W)
+
+    def generate_demo_data(self):
+        """生成模拟数据"""
+        devices = [f"DEV_{i:03d}" for i in range(1, 31)]
+        start_time = datetime(2024, 1, 1, 8, 0, 0)
+        data = []
+        for i, dev in enumerate(devices):
+            for t in range(200):
+                ct = start_time + timedelta(seconds=t * 24)
+                base = 30 + 20 * np.sin(t * 0.05 + i * 0.3)
+                noise = random.uniform(-10, 10)
+                conc = max(1, base + noise)
+                data.append({'timestamp': ct, 'device_id': dev, 'pid': round(conc, 2)})
+        
+        self.combined_df = pd.DataFrame(data)
+        self.device_ids = sorted(self.combined_df['device_id'].unique())
+        self.selected_devices = self.device_ids.copy()
+        self.original_df = self.combined_df.copy()
+        self.display_df = self.combined_df.copy()
+        
+        self.create_device_checkboxes()
+        self.update_time_range()
+        self.plot_data()
+        self.update_curve_status()
+        self.update_point_page_devices()
+        
+        self.curve_status_label.config(text=f"已加载 {len(self.device_ids)} 个设备的模拟数据")
+
+    def create_device_checkboxes(self):
+        """创建设备复选框（带滚动条）"""
+        for w in self.device_list_frame.winfo_children():
+            w.destroy()
+        self.device_vars = {}
+        
+        for did in self.device_ids:
+            var = tk.BooleanVar(value=True)
+            self.device_vars[did] = var
+            cb = ttk.Checkbutton(self.device_list_frame, text=did, variable=var, command=self.on_device_check_change)
+            cb.pack(anchor=tk.W, padx=5, pady=1)
+
+    def on_device_check_change(self):
+        self.selected_devices = [d for d, v in self.device_vars.items() if v.get()]
+        if self.display_df is not None:
+            self.plot_data()
+            self.update_curve_status()
+            self.update_point_page_devices()
+
+    def select_all_devices(self):
+        for v in self.device_vars.values():
+            v.set(True)
+        self.selected_devices = self.device_ids.copy()
+        if self.display_df is not None:
+            self.plot_data()
+            self.update_curve_status()
+            self.update_point_page_devices()
+
+    def deselect_all_devices(self):
+        for v in self.device_vars.values():
+            v.set(False)
+        self.selected_devices = []
+        if self.display_df is not None:
+            self.plot_data()
+            self.update_curve_status()
+            self.update_point_page_devices()
+
+    def update_point_page_devices(self):
+        """更新点位页面的可选设备列表"""
+        for w in self.device_pool_frame.winfo_children():
+            w.destroy()
+        
+        if not self.device_ids:
+            ttk.Label(self.device_pool_frame, text="请先在左侧加载数据", foreground="gray").pack()
+            return
+        
+        available = [d for d in self.selected_devices if d not in self.placed_devices]
+        
+        if not available:
+            ttk.Label(self.device_pool_frame, text="所有设备已绑定或未选择设备", foreground="gray").pack()
+            return
+        
+        row_frame = None
+        for i, did in enumerate(available):
+            if i % 8 == 0:
+                row_frame = ttk.Frame(self.device_pool_frame)
+                row_frame.pack(fill=tk.X, pady=2)
+            btn = tk.Label(row_frame, text=did, bg="white", fg="black",
+                          font=("Arial", 9, "bold"), width=10, height=1,
+                          relief=tk.RAISED, cursor="hand2",
+                          highlightthickness=0)               
+            btn.pack(side=tk.LEFT, padx=3, pady=2)
+            btn.bind("<Button-1>", lambda e, d=did: self.select_device_for_grid(d))
+
+    def select_device_for_grid(self, device_id):
+        self.selected_device_for_grid = device_id
+        
+        for w in self.device_pool_frame.winfo_children():
+            for child in w.winfo_children():
+                if isinstance(child, tk.Label):
+                    if child.cget("text") == device_id:
+                        child.configure(bg="#FF0000", fg="white",
+                                        highlightbackground="#FF0000",
+                                        activebackground="#FF0000")
+                    else:
+                        child.configure(bg="white", fg="black",
+                                        highlightbackground="white",
+                                        activebackground="white")
+        
+        self.point_status_label.config(text=f"已选中设备 {device_id}，请点击下方网格进行绑定")
+
+    def grid_click(self, idx):
+        """单击网格：拾取/移动/交换/填充"""
+        r, c = idx // self.GRID_COLS, idx % self.GRID_COLS
+        
+        # 情况1：点击的是已绑定的网格
+        if (r, c) in self.grid_positions:
+            dev = self.grid_positions[(r, c)]
+            
+            # 如果已经有拾取的设备，进行交换
+            if self.picked_device is not None:
+                old_r, old_c = self.picked_position
+                old_idx = old_r * self.GRID_COLS + old_c
+                old_dev = self.grid_positions[(old_r, old_c)]
+                
+                # 交换两个设备的位置
+                self.grid_positions[(old_r, old_c)] = dev
+                self.grid_positions[(r, c)] = old_dev
+                
+                # 更新显示
+                self.grid_buttons[old_idx].config(text=dev, bg="#E0E0E0", fg="black")
+                self.grid_buttons[idx].config(text=old_dev, bg="#E0E0E0", fg="black")
+                
+                # 清除拾取状态
+                self.picked_device = None
+                self.picked_position = None
+                self.point_status_label.config(text=f"设备 {old_dev} 与 {dev} 已交换位置")
+                return
+            
+            # 没有拾取的设备，则拾取当前设备
+            self.picked_device = dev
+            self.picked_position = (r, c)
+            
+            # 高亮显示拾取的设备
+            self.grid_buttons[idx].config(bg="#87CEEB", fg="black")
+            self.point_status_label.config(text=f"已拾取设备 {dev}，请点击目标位置")
+            return
+        
+        # 情况2：点击的是空格
+        if self.picked_device is not None:
+            # 有拾取的设备，移动到空格
+            old_r, old_c = self.picked_position
+            old_idx = old_r * self.GRID_COLS + old_c
+            
+            # 从旧位置移除
+            del self.grid_positions[(old_r, old_c)]
+            self.grid_buttons[old_idx].config(text="空", bg="#F0F0F0", fg="black")
+            
+            # 放置到新位置
+            self.grid_positions[(r, c)] = self.picked_device
+            self.grid_buttons[idx].config(text=self.picked_device, bg="#E0E0E0", fg="black")
+            
+            # 清除拾取状态
+            self.picked_device = None
+            self.picked_position = None
+            self.point_status_label.config(text=f"设备已移动到新位置")
+        else:
+            # 没有拾取的设备，提示先选择
+            if not self.selected_device_for_grid:
+                messagebox.showinfo("提示", "请先在上方点击选择一个设备，或双击已绑定的设备退回")
+                return
+            
+            # 从可选设备绑定到空格
+            did = self.selected_device_for_grid
+            self.selected_device_for_grid = None
+            
+            self.grid_positions[(r, c)] = did
+            self.placed_devices.append(did)
+            
+            self.grid_buttons[idx].config(text=did, bg="#E0E0E0", fg="black")
+            self.update_point_page_devices()
+            self.point_status_label.config(text=f"设备 {did} 已绑定到位置 ({r+1}, {c+1})")
+
+    def grid_double_click(self, idx):
+        """双击网格：解除绑定，退回可选设备"""
+        r, c = idx // self.GRID_COLS, idx % self.GRID_COLS
+        
+        # 检查该位置是否有设备
+        if (r, c) not in self.grid_positions:
+            return
+        
+        # 解除绑定
+        dev = self.grid_positions.pop((r, c))
+        self.placed_devices.remove(dev)
+        self.grid_buttons[idx].config(text="空", bg="#F0F0F0", fg="black")
+        
+        # 清除拾取状态
+        self.picked_device = None
+        self.picked_position = None
+        
+        # 更新可选设备列表
+        self.update_point_page_devices()
+        self.point_status_label.config(text=f"设备 {dev} 已退回可选设备列表")
+
+    def reset_grid_layout(self):
+        #清除拾取状态
+        self.picked_device = None
+        self.picked_position = None
+
+        self.grid_positions = {}
+        self.placed_devices = []
+        self.selected_device_for_grid = None
+        for btn in self.grid_buttons:
+            btn.configure(text="空", bg="#F0F0F0", fg="black")
+        self.update_point_page_devices()
+        self.anim_time_label.config(text="--:--:--")
+        self.point_status_label.config(text="网格布局已重置")
+
+    def auto_deploy(self):
+        """一键部署：按列从上往下排，5-6-7-7顺序，居中排列"""
+        # 1. 先重置当前布局
+        self.reset_grid_layout()
+        
+        # 2. 获取可选设备列表（已选中且未绑定的设备）
+        available = [d for d in self.selected_devices if d not in self.placed_devices]
+        
+        # 3. 取前25个设备
+        deploy_devices = available[:25]
+        
+        # 4. 定义每列的设备数量（按列排）
+        layout_pattern = [5, 6, 7, 7]  # 第1列5个，第2列6个，第3列7个，第4列7个
+        
+        # 5. 按列从上往下绑定，居中排列
+        device_index = 0
+        for col in range(len(layout_pattern)):
+            count = layout_pattern[col]
+            # 计算起始行，使该列居中（总行数为7）
+            start_row = (self.GRID_ROWS - count) // 2
+            
+            for row_offset in range(count):
+                if device_index >= len(deploy_devices):
+                    break
+                did = deploy_devices[device_index]
+                
+                # 实际行号 = 起始行 + 偏移
+                actual_row = start_row + row_offset
+                
+                # 绑定设备到网格
+                self.grid_positions[(actual_row, col)] = did
+                self.placed_devices.append(did)
+                
+                # 更新网格显示
+                slot_index = actual_row * self.GRID_COLS + col
+                self.grid_buttons[slot_index].config(text=did, bg="#E0E0E0", fg="black")
+                
+                device_index += 1
+            
+            if device_index >= len(deploy_devices):
+                break
+        
+        # 6. 更新可选设备列表
+        self.update_point_page_devices()
+        
+        # 7. 更新状态
+        count = len(self.placed_devices)
+        self.point_status_label.config(text=f"一键部署完成：已部署 {count} 个设备")
+
+    def toggle_animation(self):
+        if self.animation_running:
+            self.animation_paused = True
+            self.animation_running = False
+            self.start_btn.configure(text="▶ 继续")
+            if self.animation_timer:
+                self.root.after_cancel(self.animation_timer)
+            self.point_status_label.config(text="动画已暂停")
+        else:
+            if self.animation_paused:
+                self.animation_running = True
+                self.animation_paused = False
+                self.start_btn.configure(text="⏸ 暂停")
+                self.run_animation_step()
+                self.point_status_label.config(text="动画继续运行")
+            else:
+                if not self.grid_positions:
+                    messagebox.showinfo("提示", "请先在网格中绑定设备")
+                    return
+                
+                if self.display_df is not None and not self.display_df.empty:
+                    start_time = self.display_df['timestamp'].min()
+                    time_diffs = (self.combined_df['timestamp'] - start_time).abs()
+                    self.animation_index = time_diffs.idxmin()
+                else:
+                    self.animation_index = 0
+                
+                self.animation_running = True
+                self.animation_paused = False
+                self.start_btn.configure(text="⏸ 暂停")
+                self.run_animation_step()
+                self.point_status_label.config(text="动画开始运行")
+
+    def stop_animation(self):
+        self.animation_running = False
+        self.animation_paused = False
+        if self.animation_timer:
+            self.root.after_cancel(self.animation_timer)
+            self.animation_timer = None
+        
+        # 清除拾取状态
+        self.picked_device = None
+        self.picked_position = None
+
+        self.start_btn.configure(text="▶ 开始")
+        
+        if self.display_df is not None and not self.display_df.empty:
+            start_time = self.display_df['timestamp'].min()
+            time_diffs = (self.combined_df['timestamp'] - start_time).abs()
+            self.animation_index = time_diffs.idxmin()
+            self.anim_time_label.config(text=start_time.strftime("%H:%M:%S"))
+            
+            for (r, c), did in self.grid_positions.items():
+                idx = r * self.GRID_COLS + c
+                self.grid_buttons[idx].configure(text=did, bg="#E0E0E0", fg="black")
+        
+        self.point_status_label.config(text="动画已结束，已恢复到起始时间")
+
+    def run_animation_step(self):
+        if not self.animation_running:
+            return
+        
+        if self.animation_index >= len(self.combined_df):
+            self.animation_index = 0
+        
+        ct = self.combined_df['timestamp'].iloc[self.animation_index]
+        self.anim_time_label.config(text=ct.strftime("%H:%M:%S"))
+        
+        bound = list(self.grid_positions.values())
+        mask = self.combined_df['device_id'].isin(bound)
+        max_val = self.combined_df[mask]['pid'].max() if mask.any() else 1
+        
+        for (r, c), did in self.grid_positions.items():
+            idx = r * self.GRID_COLS + c
+            dc = self.combined_df[(self.combined_df['device_id'] == did) & (self.combined_df['timestamp'] == ct)]
+            if not dc.empty:
+                val = dc['pid'].iloc[0]
+                color = self.get_color_by_level(val, max_val)
+                text_color = "white" if color in ["#FF0000", "#FF8C00", "#4169E1"] else "black"
+                self.grid_buttons[idx].configure(bg=color, text=f"{val:.1f}", fg=text_color)
+        
+        self.curve_max_label.config(text=f"最大浓度值: {max_val:.2f} mg/m³")
+        self.point_status_label.config(text=f"动画运行中 | 时间: {ct.strftime('%H:%M:%S')}")
+        
+        speed = self.speed_var.get()
+        base_delay = 400
+        delay = max(20, int(base_delay /speed)) #速度越快，延迟越小
+        self.animation_index += 1
+        self.animation_timer = self.root.after(delay, self.run_animation_step)
+
+    def update_time_range(self):
+        if self.display_df is not None and not self.display_df.empty:
+            s = self.display_df['timestamp'].min()
+            e = self.display_df['timestamp'].max()
+            self.time_range_label.config(text=f"{s.strftime('%H:%M:%S')} 至 {e.strftime('%H:%M:%S')}")
+            self.start_time_var.set(s.strftime('%H:%M:%S'))
+            self.end_time_var.set(e.strftime('%H:%M:%S'))
+
+    def update_curve_status(self):
+        if self.display_df is not None and not self.display_df.empty and self.selected_devices:
+            vis = self.display_df[self.display_df['device_id'].isin(self.selected_devices)]
+            if not vis.empty:
+                mr = vis.loc[vis['pid'].idxmax()]
+                self.curve_max_label.config(text=f"最大浓度值: {mr['pid']:.2f} mg/m³ | 设备: {mr['device_id']} | 时间: {mr['timestamp'].strftime('%H:%M:%S')}")
+
+    def setup_span_selector(self):
+        if self.span_selector is not None:
+            try:
+                self.span_selector.disconnect_events()
+            except:
+                pass
+        
+        self.span_selector = SpanSelector(
+            self.ax,
+            self.on_span_select,
+            direction='horizontal',
+            useblit=True,
+            props=dict(alpha=0.3, facecolor='yellow'),
+            interactive=False,
+            drag_from_anywhere=True
+        )
+
+    def on_span_select(self, xmin, xmax):
+        if self.display_df is None or self.display_df.empty:
+            return
+        
+        xmin_t = pd.Timestamp(xmin, unit='D')
+        xmax_t = pd.Timestamp(xmax, unit='D')
+        
+        if (xmax_t - xmin_t).total_seconds() < 1:
+            return
+        
+        self.zoom_history.append({'df': self.display_df.copy()})
+        
+        mask = (self.display_df['timestamp'] >= xmin_t) & (self.display_df['timestamp'] <= xmax_t)
+        zoomed = self.display_df[mask].copy()
+        
+        if zoomed.empty:
+            return
+        
+        self.display_df = zoomed
+        self.plot_data(self.display_df)
+        self.update_time_range()
+        self.update_curve_status()
+        self.curve_status_label.config(text=f"已放大: {xmin_t.strftime('%H:%M:%S')} - {xmax_t.strftime('%H:%M:%S')}")
+
+    def plot_data(self, df=None):
+        if df is None:
+            df = self.display_df
+        if df is None or df.empty:
+            return
+        
+        self.ax.clear()
+        visible = [d for d in self.selected_devices if d in self.device_ids]
+        
+        if not visible:
+            self.ax.text(0.5, 0.5, "请勾选要显示的设备", ha='center', va='center', fontsize=14, transform=self.ax.transAxes)
+            self.canvas.draw()
+            return
+        
+        colors = plt.cm.tab20(np.linspace(0, 1, len(visible)))
+        for i, dev in enumerate(visible):
+            dd = df[df['device_id'] == dev]
+            if not dd.empty:
+                self.ax.plot(dd['timestamp'], dd['pid'], color=colors[i], alpha=0.7, linewidth=0.8, label=dev)
+                mi = dd['pid'].idxmax()
+                mp = dd.loc[mi]
+                self.ax.annotate(dev, xy=(mp['timestamp'], mp['pid']), xytext=(8, 8),
+                               textcoords='offset points', fontsize=8, color=colors[i], fontweight='bold',
+                               bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='none', alpha=0.6))
+        
+        self.ax.set_title(f"浓度曲线 (显示{len(visible)}个设备)")
+        self.ax.set_xlabel("时间")
+        self.ax.set_ylabel("浓度值 (mg/m³)")
+        self.ax.grid(True, alpha=0.3)
+        self.ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+        self.fig.autofmt_xdate(rotation=45)
+        
+        self.setup_span_selector()
+        
+        self.canvas.draw()
+
+        self.update_curve_status_based_on_current_view(df, visible)
+
+    def update_curve_status_based_on_current_view(self, df, vis):
+        """根据当前缩放的视图更新状态栏"""
+        if df is None or df.empty or not vis:
+            return
+        
+        # 只计算当前显示范围内的设备数据
+        current_data = df[df['device_id'].isin(vis)]
+        
+        if current_data.empty:
+            return
+        
+        # 找到当前视图中的最大值
+        max_row = current_data.loc[current_data[self.value_col].idxmax()]
+        max_value = max_row[self.value_col]
+        max_device = max_row['device_id']
+        max_time = max_row[self.time_col]
+        
+        # 更新状态栏
+        self.curve_max_label.config(
+            text=f"最大浓度值: {max_value:.2f} mg/m³ | 设备: {max_device} | 时间: {max_time.strftime('%H:%M:%S')}"
+        )
+        
+        # 更新统计信息
+        device_count = len(current_data['device_id'].unique())
+        row_count = len(current_data)
+        self.curve_stats_label.config(
+            text=f"显示设备数: {device_count} | 数据行数: {row_count}"
